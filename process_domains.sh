@@ -2,6 +2,7 @@
 # Resumable CSV file processing with row-count based output splitting and restart support
 
 BASE_DIR="$HOME/domain_system"
+
 PENDING_DIR="$BASE_DIR/pending"
 PROCESSING_DIR="$BASE_DIR/processing"
 COMPLETED_DIR="$BASE_DIR/completed"
@@ -31,7 +32,6 @@ RESOLVERS=(
 
 mkdir -p "$PROCESSING_DIR" "$RESULTS_ACTIVE" "$RESULTS_FAIL" "$LOGS" "$COMPLETED_DIR" "$STATE_DIR"
 
-# State files for counters
 ACTIVE_STATE="$STATE_DIR/active_state"
 FAIL_STATE="$STATE_DIR/fail_state"
 
@@ -39,119 +39,77 @@ get_tld() { domain=$1; echo "${domain##*.}"; }
 
 is_valid_ip() {
     local IPS=$1
-    for ip in ${IPS//,/ }; do
+    for ip in ${IPS//|/ }; do   # UPDATED: split by | instead of comma
         if ! [[ $ip =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then return 1; fi
     done
     return 0
 }
 
-# Initialize or read state
 init_state() {
-    # Create state files if don't exist
-    if [[ ! -f "$ACTIVE_STATE.part" ]]; then
-        echo "1" > "$ACTIVE_STATE.part"
-    fi
-    if [[ ! -f "$ACTIVE_STATE.count" ]]; then
-        echo "0" > "$ACTIVE_STATE.count"
-    fi
-    
-    if [[ ! -f "$FAIL_STATE.part" ]]; then
-        echo "1" > "$FAIL_STATE.part"
-    fi
-    if [[ ! -f "$FAIL_STATE.count" ]]; then
-        echo "0" > "$FAIL_STATE.count"
-    fi
-    
-    # Resume from existing state - calculate current counts from actual files
+    [[ ! -f "$ACTIVE_STATE.part" ]] && echo "1" > "$ACTIVE_STATE.part"
+    [[ ! -f "$ACTIVE_STATE.count" ]] && echo "0" > "$ACTIVE_STATE.count"
+    [[ ! -f "$FAIL_STATE.part" ]] && echo "1" > "$FAIL_STATE.part"
+    [[ ! -f "$FAIL_STATE.count" ]] && echo "0" > "$FAIL_STATE.count"
+
     local active_part=$(cat "$ACTIVE_STATE.part")
     local fail_part=$(cat "$FAIL_STATE.part")
-    
+
     local active_file="$RESULTS_ACTIVE/active_part${active_part}.csv"
     local fail_file="$RESULTS_FAIL/fail_part${fail_part}.csv"
-    
-    # Calculate actual row count (excluding header)
+
     local active_count=0
-    if [[ -f "$active_file" ]]; then
-        active_count=$(($(wc -l < "$active_file") - 1))
-        if (( active_count < 0 )); then active_count=0; fi
-    fi
-    
-    local fail_count=0  
-    if [[ -f "$fail_file" ]]; then
-        fail_count=$(($(wc -l < "$fail_file") - 1))
-        if (( fail_count < 0 )); then fail_count=0; fi
-    fi
-    
-    # Update state with actual counts
+    [[ -f "$active_file" ]] && active_count=$(($(wc -l < "$active_file") - 1))
+    ((active_count<0)) && active_count=0
+
+    local fail_count=0
+    [[ -f "$fail_file" ]] && fail_count=$(($(wc -l < "$fail_file") - 1))
+    ((fail_count<0)) && fail_count=0
+
     echo "$active_count" > "$ACTIVE_STATE.count"
     echo "$fail_count" > "$FAIL_STATE.count"
-    
-    echo "Resuming from:"
-    echo "- Active: part $active_part, count $active_count/$MAX_ROWS"
-    echo "- Fail: part $fail_part, count $fail_count/$MAX_ROWS"
 }
 
-# Get current file and count (thread-safe)
 get_current_file() {
     local type=$1
-    local state_file=""
-    local results_dir=""
-    local file_prefix=""
-    
+    local state_file results_dir file_prefix
+
     if [[ $type == "active" ]]; then
-        state_file="$ACTIVE_STATE"
-        results_dir="$RESULTS_ACTIVE"
-        file_prefix="active_part"
+        state_file="$ACTIVE_STATE"; results_dir="$RESULTS_ACTIVE"; file_prefix="active_part"
     else
-        state_file="$FAIL_STATE"
-        results_dir="$RESULTS_FAIL"
-        file_prefix="fail_part"
+        state_file="$FAIL_STATE"; results_dir="$RESULTS_FAIL"; file_prefix="fail_part"
     fi
-    
+
     (
         flock -x 200
         local current_part=$(cat "$state_file.part" 2>/dev/null || echo "1")
         local current_count=$(cat "$state_file.count" 2>/dev/null || echo "0")
         local current_file="$results_dir/${file_prefix}${current_part}.csv"
-        
-        echo "DEBUG: $type - part: $current_part, count: $current_count, max: $MAX_ROWS" >&2
-        
-        # Check if we need to rotate BEFORE getting file
-        if (( current_count >= MAX_ROWS )); then
+
+        (( current_count >= MAX_ROWS )) && {
             ((current_part++))
             current_count=0
             current_file="$results_dir/${file_prefix}${current_part}.csv"
-            
             echo "$current_part" > "$state_file.part"
             echo "$current_count" > "$state_file.count"
-            echo "Rotated to new $type file: ${file_prefix}${current_part}.csv" >&2
-        fi
-        
-        # Create file with header if doesn't exist
-        if [[ ! -f "$current_file" ]]; then
+        }
+
+        [[ ! -f "$current_file" ]] && {
             if [[ $type == "active" ]]; then
                 echo "second_level_domain,top_level_domain,ip_address,status,timestamp" > "$current_file"
             else
                 echo "second_level_domain,top_level_domain,reason,timestamp" > "$current_file"
             fi
-            echo "Created new $type file: $current_file" >&2
-        fi
-        
+        }
+
         echo "$current_file"
     ) 200>/tmp/domain_state_${type}.lock
 }
 
-# Increment counter and return new count
 increment_counter() {
     local type=$1
-    local state_file=""
-    
-    if [[ $type == "active" ]]; then
-        state_file="$ACTIVE_STATE"
-    else
-        state_file="$FAIL_STATE"
-    fi
-    
+    local state_file
+    [[ $type == "active" ]] && state_file="$ACTIVE_STATE" || state_file="$FAIL_STATE"
+
     (
         flock -x 200
         local current_count=$(cat "$state_file.count" 2>/dev/null || echo "0")
@@ -164,21 +122,16 @@ increment_counter() {
 check_domain() {
     local domain=$1
     local LOGFILE=$2
-
-    local SUCCESS=0
-    local attempt=0
-    local IPS=""
+    local SUCCESS=0 attempt=0 IPS=""
 
     while [[ $SUCCESS -eq 0 && $attempt -lt $RETRIES ]]; do
         ((attempt++))
         for RESOLVER in "${RESOLVERS[@]}"; do
             IPS=$(timeout "$TIMEOUT" nslookup "$domain" "$RESOLVER" 2>/dev/null \
                   | awk '/^Address: / {print $2}' \
-                  | tr '\n' ',' | sed 's/,$//')
-            if [[ -n "$IPS" ]] && is_valid_ip "$IPS"; then
-                SUCCESS=1
-                break
-            fi
+                  | tr '\n' '|' | sed 's/|$//')   # UPDATED: join IPs with |
+
+            [[ -n "$IPS" ]] && is_valid_ip "$IPS" && { SUCCESS=1; break; }
         done
     done
 
@@ -190,65 +143,44 @@ check_domain() {
         local active_file=$(get_current_file "active")
         echo "$SLD,$TLD,$IPS,Active,$TIMESTAMP" >> "$active_file"
         echo "$SLD,$TLD,$IPS,Active,$TIMESTAMP" >> "$LOGFILE"
-        local count=$(increment_counter "active")
-        echo "Active: $domain -> $(basename "$active_file") (count: $count/$MAX_ROWS)"
+        increment_counter "active" >/dev/null
     else
         local REASON="NXDOMAIN/Timeout"
         local fail_file=$(get_current_file "fail")
         echo "$SLD,$TLD,$REASON,$TIMESTAMP" >> "$fail_file"
         echo "$SLD,$TLD,$REASON,$TIMESTAMP" >> "$LOGFILE"
-        local count=$(increment_counter "fail")
-        echo "Failed: $domain -> $(basename "$fail_file") (count: $count/$MAX_ROWS)"
+        increment_counter "fail" >/dev/null
     fi
 }
 
-# Run jobs with parallel control
 run_job() {
-    local d=$1
-    local LOGFILE=$2
+    local d=$1 LOGFILE=$2
     check_domain "$d" "$LOGFILE" &
-
-    # limit jobs to MAX_JOBS
-    while (( $(jobs -r | wc -l) >= MAX_JOBS )); do
-        sleep 0.1
-    done
+    while (( $(jobs -r | wc -l) >= MAX_JOBS )); do sleep 0.1; done
 }
 
 process_file() {
-    local FILE=$1
-    local BASENAME=$(basename "$FILE")
-    local LOGFILE="$LOGS/${BASENAME%.csv}.log"
-
+    local FILE=$1 BASENAME=$(basename "$FILE") LOGFILE="$LOGS/${BASENAME%.csv}.log"
     echo "Processing $BASENAME ..." | tee -a "$LOGFILE"
     init_state
 
-    # Get already processed domains from ALL existing files
-    echo "Checking already processed domains..."
     declare -A done
-    
-    # Check all active files
     for active_file in "$RESULTS_ACTIVE"/active_part*.csv; do
-        if [[ -f "$active_file" ]]; then
-            echo "Checking $(basename "$active_file")..."
-            while IFS=',' read -r sld tld ip status timestamp || [[ -n "$sld" ]]; do
-                [[ "$sld" == "second_level_domain" ]] && continue  # Skip header
-                [[ -n "$sld" ]] && done["$sld"]=1
-            done < "$active_file"
-        fi
-    done
-    
-    # Check all fail files  
-    for fail_file in "$RESULTS_FAIL"/fail_part*.csv; do
-        if [[ -f "$fail_file" ]]; then
-            echo "Checking $(basename "$fail_file")..."
-            while IFS=',' read -r sld tld reason timestamp || [[ -n "$sld" ]]; do
-                [[ "$sld" == "second_level_domain" ]] && continue  # Skip header
-                [[ -n "$sld" ]] && done["$sld"]=1
-            done < "$fail_file"
-        fi
+        [[ -f "$active_file" ]] || continue
+        while IFS=',' read -r sld tld ip status timestamp || [[ -n "$sld" ]]; do
+            [[ "$sld" == "second_level_domain" ]] && continue
+            [[ -n "$sld" ]] && done["$sld"]=1
+        done < "$active_file"
     done
 
-    # Get domains to process (skip already processed)
+    for fail_file in "$RESULTS_FAIL"/fail_part*.csv; do
+        [[ -f "$fail_file" ]] || continue
+        while IFS=',' read -r sld tld reason timestamp || [[ -n "$sld" ]]; do
+            [[ "$sld" == "second_level_domain" ]] && continue
+            [[ -n "$sld" ]] && done["$sld"]=1
+        done < "$fail_file"
+    done
+
     domains=()
     while IFS= read -r DOMAIN || [[ -n "$DOMAIN" ]]; do
         [[ -z "$DOMAIN" ]] && continue
@@ -278,7 +210,6 @@ process_file() {
     echo "Completed $BASENAME at $(date)" | tee -a "$LOGFILE"
 }
 
-# Progress display function
 show_progress() {
     local active_part=$(cat "$ACTIVE_STATE.part" 2>/dev/null || echo "1")
     local active_count=$(cat "$ACTIVE_STATE.count" 2>/dev/null || echo "0")
@@ -292,26 +223,17 @@ show_progress() {
     echo "================================="
 }
 
-# Add cleanup function for graceful shutdown
 cleanup() {
     echo ""
     echo "Script interrupted! Cleaning up..."
-    
-    # Wait for running jobs to complete
-    echo "Waiting for running jobs to complete..."
     wait
-    
-    # Show final status
     show_progress
-    
     echo "Script stopped. State saved. You can resume by running the script again."
     exit 0
 }
 
-# Set up signal handlers
 trap cleanup SIGINT SIGTERM
 
-# Main processing loop
 echo "Starting domain processing..."
 echo "Press Ctrl+C to stop gracefully"
 
@@ -323,7 +245,6 @@ done
 
 echo "All pending files processed."
 
-# Final summary
 active_part=$(cat "$ACTIVE_STATE.part" 2>/dev/null || echo "1")
 active_count=$(cat "$ACTIVE_STATE.count" 2>/dev/null || echo "0")
 fail_part=$(cat "$FAIL_STATE.part" 2>/dev/null || echo "1")
