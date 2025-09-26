@@ -1,6 +1,5 @@
 #!/bin/bash
 # Database import script for domain processing results
-# Fully updated: password warning removed, numeric outputs fixed
 
 # Database config (use ~/.my.cnf for credentials)
 DB_HOST="localhost"
@@ -9,6 +8,7 @@ DB_USER="root"    # actual auth via .my.cnf
 
 # Directories
 BASE_DIR="$HOME/domain_system"
+
 RESULTS_ACTIVE="$BASE_DIR/results/active"
 RESULTS_FAIL="$BASE_DIR/results/fail"
 COMPLETED_DIR="$BASE_DIR/completed"
